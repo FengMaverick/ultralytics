@@ -474,7 +474,7 @@ class Bottleneck(nn.Module):
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, k[0], 1)
         self.cv2 = Conv(c_, c2, k[1], 1, g=g)
-        self.add = shortcut and c1 == c2
+        self.add = shortcut and c1 == c2 # 残差连接的开关：只有开启 shortcut 且输入输出通道数相等时，才会执行残差相加。
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply bottleneck with optional shortcut connection."""

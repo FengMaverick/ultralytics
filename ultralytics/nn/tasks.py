@@ -97,7 +97,11 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
-
+from ultralytics.nn.Conv.FDConv_initialversion import C3k2_FDConv
+from ultralytics.nn.block.StripRCNN import C3k2_Strip,StripBlock
+from ultralytics.nn.block.mona import C2PSA_Mona,C3k2_Mona
+from ultralytics.nn.updownsample.dysample import DySample
+from ultralytics.nn.sppf.SPPF_Container import SPPF_Container
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -1587,6 +1591,12 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            C3k2_FDConv,
+            C3k2_Strip,
+            StripBlock,
+            C2PSA_Mona,
+            C3k2_Mona,
+            SPPF_Container
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1606,6 +1616,11 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            C3k2_FDConv,
+            C3k2_Strip,
+            StripBlock,
+            C2PSA_Mona,
+            C3k2_Mona
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1645,6 +1660,10 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is DySample:
+            c2 = ch[f]
+            args = [c2, *args]
+
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]

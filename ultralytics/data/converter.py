@@ -378,11 +378,15 @@ def convert_segment_masks_to_yolo_seg(masks_dir: str, output_dir: str, classes: 
                 ├─ mask_yolo_03.txt
                 └─ mask_yolo_04.txt
     """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     pixel_to_class_mapping = {i + 1: i for i in range(classes)}
     for mask_path in Path(masks_dir).iterdir():
         if mask_path.suffix in {".png", ".jpg"}:
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)  # Read the mask image in grayscale
-            img_height, img_width = mask.shape  # Get image dimensions
+            # mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)  # Read the mask image in grayscale
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+            img_height, img_width = mask.shape[:2]  # Get image dimensions
             LOGGER.info(f"Processing {mask_path} imgsz = {img_height} x {img_width}")
 
             unique_values = np.unique(mask)  # Get unique pixel values representing different classes
