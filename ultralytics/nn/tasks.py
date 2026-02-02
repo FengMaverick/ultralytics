@@ -97,11 +97,11 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
-from ultralytics.nn.Conv.FDConv_initialversion import C3k2_FDConv
 from ultralytics.nn.block.StripRCNN import C3k2_Strip,StripBlock
 from ultralytics.nn.block.mona import C2PSA_Mona,C3k2_Mona
 from ultralytics.nn.updownsample.dysample import DySample
 from ultralytics.nn.sppf.SPPF_Container import SPPF_Container
+from ultralytics.nn.Conv.dcnv4 import C3k2_DCNv4
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -411,7 +411,16 @@ class DetectionModel(BaseModel):
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            
+            # DCNv4 requires CUDA, so force stride calculation on GPU if available
+            if torch.cuda.is_available():
+                self.model.to('cuda')
+                dummy_input = torch.zeros(1, ch, s, s).to('cuda')
+                m.stride = torch.tensor([s / x.shape[-2] for x in _forward(dummy_input)]).cpu()
+                self.model.cpu() # move back to cpu for initialization consistency
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+
             self.stride = m.stride
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
@@ -1591,12 +1600,12 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            C3k2_FDConv,
             C3k2_Strip,
             StripBlock,
             C2PSA_Mona,
             C3k2_Mona,
-            SPPF_Container
+            SPPF_Container,
+            C3k2_DCNv4
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1616,11 +1625,11 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            C3k2_FDConv,
             C3k2_Strip,
             StripBlock,
             C2PSA_Mona,
-            C3k2_Mona
+            C3k2_Mona,
+            C3k2_DCNv4
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
