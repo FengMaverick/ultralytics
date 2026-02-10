@@ -102,6 +102,10 @@ from ultralytics.nn.block.mona import C2PSA_Mona,C3k2_Mona
 from ultralytics.nn.updownsample.dysample import DySample
 from ultralytics.nn.sppf.SPPF_Container import SPPF_Container
 from ultralytics.nn.Conv.dcnv4 import C3k2_DCNv4
+from ultralytics.nn.backbone.EfficientViM import C3k2_EfficientVIM_att
+from ultralytics.nn.block.SEAM  import SEAM
+from ultralytics.nn.block.DEANet_SWS import CGAFusion_SWS
+
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -1605,7 +1609,9 @@ def parse_model(d, ch, verbose=True):
             C2PSA_Mona,
             C3k2_Mona,
             SPPF_Container,
-            C3k2_DCNv4
+            C3k2_DCNv4,
+            C3k2_EfficientVIM_att,
+            SEAM
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1629,7 +1635,8 @@ def parse_model(d, ch, verbose=True):
             StripBlock,
             C2PSA_Mona,
             C3k2_Mona,
-            C3k2_DCNv4
+            C3k2_DCNv4,
+            C3k2_EfficientVIM_att
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1671,6 +1678,9 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f], *args]
         elif m is DySample:
             c2 = ch[f]
+            args = [c2, *args]
+        elif m is CGAFusion_SWS:
+            c2 = ch[f[1]]
             args = [c2, *args]
 
         elif m in frozenset({HGStem, HGBlock}):
