@@ -14,9 +14,72 @@ from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, probiou, bbox_mpdiou, bbox_inner_iou, bbox_focaler_iou, bbox_inner_mpdiou, bbox_focaler_mpdiou, wasserstein_loss, WiseIouLoss
 from .tal import bbox2dist, rbox2dist
 
+######################################## MAGIC Start ########################################
+class SlideLoss(nn.Module):
+    def __init__(self, loss_fcn):
+        super(SlideLoss, self).__init__()
+        self.loss_fcn = loss_fcn
+        self.reduction = loss_fcn.reduction
+        self.loss_fcn.reduction = 'none'  # required to apply SL to each element
+
+    def forward(self, pred, true, auto_iou=0.5):
+        loss = self.loss_fcn(pred, true)
+        if auto_iou < 0.2:
+            auto_iou = 0.2
+        b1 = true <= auto_iou - 0.1
+        a1 = 1.0
+        b2 = (true > (auto_iou - 0.1)) & (true < auto_iou)
+        a2 = math.exp(1.0 - auto_iou)
+        b3 = true >= auto_iou
+        a3 = torch.exp(-(true - 1.0))
+        modulating_weight = a1 * b1 + a2 * b2 + a3 * b3
+        loss *= modulating_weight
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:  # 'none'
+            return loss
+
+class EMASlideLoss:
+    def __init__(self, loss_fcn, decay=0.999, tau=2000):
+        super(EMASlideLoss, self).__init__()
+        self.loss_fcn = loss_fcn
+        self.reduction = loss_fcn.reduction
+        self.loss_fcn.reduction = 'none'  # required to apply SL to each element
+        self.decay = decay
+        self.tau = tau
+        self.is_train = True
+        self.updates = 0
+        self.iou_mean = 1.0
+
+    def __call__(self, pred, true, auto_iou=0.5):
+        if self.is_train and auto_iou != -1:
+            self.updates += 1
+            d = self.decay * (1 - math.exp(-self.updates / self.tau))
+            self.iou_mean = d * self.iou_mean + (1 - d) * float(auto_iou.detach())
+        auto_iou = self.iou_mean
+        loss = self.loss_fcn(pred, true)
+        if auto_iou < 0.2:
+            auto_iou = 0.2
+        b1 = true <= auto_iou - 0.1
+        a1 = 1.0
+        b2 = (true > (auto_iou - 0.1)) & (true < auto_iou)
+        a2 = math.exp(1.0 - auto_iou)
+        b3 = true >= auto_iou
+        a3 = torch.exp(-(true - 1.0))
+        modulating_weight = a1 * b1 + a2 * b2 + a3 * b3
+        loss *= modulating_weight
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:  # 'none'
+            return loss
+######################################## MAGIC End ########################################
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -114,6 +177,11 @@ class BboxLoss(nn.Module):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
+        # WiseIOU
+        self.use_wiseiou = False
+        if self.use_wiseiou:
+            self.wiou_loss = WiseIouLoss(ltype='WIoU', monotonous=False, inner_iou=False, focaler_iou=False)
+
     def forward(
         self,
         pred_dist: torch.Tensor,
@@ -125,11 +193,26 @@ class BboxLoss(nn.Module):
         fg_mask: torch.Tensor,
         imgsz: torch.Tensor,
         stride: torch.Tensor,
+        mpdiou_hw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        # iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        # loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        if self.use_wiseiou:
+            wiou = self.wiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], ret_iou=False, ratio=0.7, d=0.0, u=0.95).unsqueeze(-1)
+            # wiou = self.wiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], ret_iou=False, ratio=0.7, d=0.0, u=0.95, **{'scale':0.0}).unsqueeze(-1) # Wise-ShapeIoU,Wise-Inner-ShapeIoU,Wise-Focaler-ShapeIoU
+            # wiou = self.wiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], ret_iou=False, ratio=0.7, d=0.0, u=0.95, **{'mpdiou_hw':mpdiou_hw[fg_mask]}).unsqueeze(-1) # Wise-MPDIoU,Wise-Inner-MPDIoU,Wise-Focaler-MPDIoU
+            loss_iou = (wiou * weight).sum() / target_scores_sum
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            # iou = bbox_inner_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True, ratio=0.7)
+            # iou = bbox_mpdiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, mpdiou_hw=mpdiou_hw[fg_mask])
+            # iou = bbox_inner_mpdiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, mpdiou_hw=mpdiou_hw[fg_mask], ratio=0.7)
+            # iou = bbox_focaler_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True, d=0.0, u=0.95)
+            # iou = bbox_focaler_mpdiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, mpdiou_hw=mpdiou_hw[fg_mask], d=0.0, u=0.95)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -340,6 +423,9 @@ class v8DetectionLoss:
 
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        # self.bce = EMASlideLoss(nn.BCEWithLogitsLoss(reduction='none'))  # Exponential Moving Average Slide Loss
+        # self.bce = SlideLoss(nn.BCEWithLogitsLoss(reduction='none')) # Slide Loss
+
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
@@ -422,7 +508,20 @@ class v8DetectionLoss:
         target_scores_sum = max(target_scores.sum(), 1)
 
         # Cls loss
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # [!!!Original Code!!!]
+        # loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # [!!!Modified Code!!!]
+        if isinstance(self.bce, nn.BCEWithLogitsLoss):
+            print("================= BCEWithLogitsLoss =================")
+            loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        elif isinstance(self.bce, (EMASlideLoss, SlideLoss)):
+            print("================= EMASlideLoss or SlideLoss =================")
+            if fg_mask.sum():
+                auto_iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).mean()
+            else:
+                auto_iou = -1
+            loss[1] = self.bce(pred_scores, target_scores.to(dtype), auto_iou).sum() / target_scores_sum  # BCE
 
         # Bbox loss
         if fg_mask.sum():
@@ -436,6 +535,7 @@ class v8DetectionLoss:
                 fg_mask,
                 imgsz,
                 stride_tensor,
+                mpdiou_hw=((imgsz[0] ** 2 + imgsz[1] ** 2) / torch.square(stride_tensor)).repeat(1, batch_size).transpose(1, 0)
             )
 
         loss[0] *= self.hyp.box  # box gain
@@ -542,23 +642,49 @@ class v8SegmentationLoss(v8DetectionLoss):
         gt_mask: torch.Tensor, pred: torch.Tensor, proto: torch.Tensor, xyxy: torch.Tensor, area: torch.Tensor
     ) -> torch.Tensor:
         """Compute the instance segmentation loss for a single image.
-
+    
         Args:
             gt_mask (torch.Tensor): Ground truth mask of shape (N, H, W), where N is the number of objects.
             pred (torch.Tensor): Predicted mask coefficients of shape (N, 32).
             proto (torch.Tensor): Prototype masks of shape (32, H, W).
             xyxy (torch.Tensor): Ground truth bounding boxes in xyxy format, normalized to [0, 1], of shape (N, 4).
             area (torch.Tensor): Area of each ground truth bounding box of shape (N,).
-
+    
         Returns:
             (torch.Tensor): The calculated mask loss for a single image.
-
+    
         Notes:
             The function uses the equation pred_mask = torch.einsum('in,nhw->ihw', pred, proto) to produce the
             predicted masks from the prototype masks and predicted mask coefficients.
         """
         pred_mask = torch.einsum("in,nhw->ihw", pred, proto)  # (n, 32) @ (32, 80, 80) -> (n, 80, 80)
-        loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+        
+        # [!!!Original Code!!!]
+        # loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+        
+        # [!!!Modified Code!!!]: Using Numerically Stable Focal Loss for Segmentation
+        gamma = 2.0
+        alpha = 0.25
+        
+        # 1. 使用极其稳定的内置函数计算展开的基础负对数似然 (即公式中的 -log(p) 部分)
+        # 这个函数相当于自动且安全地算好了 -log(p_i) 和 -log(1-p_i)
+        bce_loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+        
+        # 2. 获取预测概率 (仅用于计算权重系数，这里不需要梯度参与核心发散计算)
+        p = torch.sigmoid(pred_mask)
+        
+        # 3. 计算真正的预测概率 p_t (如果是正样本，p_t 就是 p；如果是负样本，p_t 就是 1-p)
+        p_t = p * gt_mask + (1 - p) * (1 - gt_mask)
+        
+        # 4. 计算 Focal Loss 的调制权重: (1 - p_t)^gamma
+        modulating_factor = (1.0 - p_t) ** gamma
+        
+        # 5. 计算 Alpha 类别权重: 如果是正样本乘 alpha，否则乘 (1 - alpha)
+        alpha_weight = alpha * gt_mask + (1 - alpha) * (1 - gt_mask)
+        
+        # 6. 一切拼接: 权重系数 * 绝对安全的底层 BCE (等价于你的图示公式，但是数值绝对稳定不会产生 NaN)
+        loss = alpha_weight * modulating_factor * bce_loss
+        
         return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).sum()
 
     def calculate_segmentation_loss(

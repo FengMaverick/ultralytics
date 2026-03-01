@@ -13,6 +13,8 @@ from .tasks import (
     yaml_model_load,
 )
 
+from .modules import Detect_LADH, Segment_LADH
+
 __all__ = (
     "BaseModel",
     "ClassificationModel",
@@ -24,4 +26,6 @@ __all__ = (
     "parse_model",
     "torch_safe_load",
     "yaml_model_load",
+    "Detect_LADH",
+    "Segment_LADH",
 )

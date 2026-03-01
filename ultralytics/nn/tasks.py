@@ -66,12 +66,14 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
-    TorchVision,
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    Detect_LADH,
+    Segment_LADH,
+    TorchVision
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -100,12 +102,40 @@ from ultralytics.utils.torch_utils import (
 from ultralytics.nn.block.StripRCNN import C3k2_Strip,StripBlock
 from ultralytics.nn.block.mona import C2PSA_Mona,C3k2_Mona
 from ultralytics.nn.updownsample.dysample import DySample
-from ultralytics.nn.sppf.SPPF_Container import SPPF_Container
+from ultralytics.nn.sppf.SPPF_Container import SPPF_Container, EfficientContextSPPF, SPPF_Container_PE
+from ultralytics.nn.sppf.SPPF_improve import SPPF_improve
+from ultralytics.nn.sppf.SPPF_EMA_Ultimate import SPPF_EMA_Ultimate
+from ultralytics.nn.sppf.SPPF_LSKA import SPPF_LSKA
 from ultralytics.nn.Conv.dcnv4 import C3k2_DCNv4
 from ultralytics.nn.backbone.EfficientViM import C3k2_EfficientVIM_att
 from ultralytics.nn.block.SEAM  import SEAM
+from ultralytics.nn.block.DEANet import CGAFusion
 from ultralytics.nn.block.DEANet_SWS import CGAFusion_SWS
-
+from ultralytics.nn.block.LEGNet import C3k2_LFEM
+from ultralytics.nn.backbone.RepViTBlock import C3k2_RepViTBlock
+from ultralytics.nn.block.SimAM import SimAM
+from ultralytics.nn.sppf.DCNv4_SPPF import DCNv4_SPPF
+# from ultralytics.nn.backbone.MobileNetV4Block import C3k2_MobileNetV4
+from ultralytics.nn.backbone.starnet import C3k2_StarNB
+from ultralytics.nn.block.BMA import MDJA
+from ultralytics.nn.block.LSK import LSKBlock
+from ultralytics.nn.block.BRA import BiLevelRoutingAttention
+from ultralytics.nn.backbone.C3k2_changed import C3k2_GCConv, C3k2_LSBlock, C3k2_FDConv, C3k2_ScConv
+from ultralytics.nn.neck.hyperyolo import HyperComputeModule,MANet
+from ultralytics.nn.neck.goldyolo import IFM,SimFusion_3in,SimFusion_4in,InjectionMultiSum_Auto_pool,PyramidPoolAgg,TopBasicLayer,AdvPoolFusion
+from ultralytics.nn.attention.attention import SegNext_Attention, EMA, SimAMWithSlicing, Conv_SWS, MultiDilatelocalAttention, EMCA_attention
+from ultralytics.nn.neck.PST import PST
+# from ultralytics.nn.neck.bifpn import BiFPNFusion
+from ultralytics.nn.neck.DAMO_YOLO import CSPStage
+from ultralytics.nn.neck.slimneck import VoVGSCSP,GSConv,SDI,Fusion,SBA,ContextGuideFusionModule,MSBlock
+from ultralytics.nn.neck.eucb import EUCB,EUCB_SC
+from ultralytics.nn.neck.carafe import CARAFE
+from ultralytics.nn.neck.Converse2D import Converse2D
+from ultralytics.nn.neck.overlock import GDSAFusion
+from ultralytics.nn.neck.dpcf import DPCF
+from ultralytics.nn.neck.HAFB import HAFB
+from ultralytics.nn.Conv.DualConv import DualConv
+from ultralytics.nn.Conv.DynamicConv import DynamicConv
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -1557,7 +1587,11 @@ def parse_model(d, ch, verbose=True):
         if not scale:
             scale = next(iter(scales.keys()))
             LOGGER.warning(f"no model scale passed. Assuming scale='{scale}'.")
-        depth, width, max_channels = scales[scale]
+        # depth, width, max_channels = scales[scale]
+        if len(scales[scale]) == 3:
+            depth, width, max_channels = scales[scale]
+        elif len(scales[scale]) == 4:
+            depth, width, max_channels, threshold = scales[scale]
 
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU()
@@ -1609,9 +1643,34 @@ def parse_model(d, ch, verbose=True):
             C2PSA_Mona,
             C3k2_Mona,
             SPPF_Container,
+            EfficientContextSPPF,
+            SPPF_Container_PE,
+            SPPF_improve,
+            SPPF_EMA_Ultimate,
             C3k2_DCNv4,
             C3k2_EfficientVIM_att,
-            SEAM
+            SEAM,
+            C3k2_LFEM,
+            C3k2_RepViTBlock,
+            DCNv4_SPPF,
+            # C3k2_MobileNetV4,
+            C3k2_StarNB,
+            MDJA,
+            C3k2_GCConv,
+            C3k2_LSBlock,
+            C3k2_FDConv,
+            C3k2_ScConv,
+            SPPF_LSKA,
+            MANet,
+            CSPStage,
+            VoVGSCSP,
+            GSConv,
+            Converse2D,
+            EMA,
+            Conv_SWS,
+            DualConv,
+            DynamicConv,
+            MSBlock
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1636,23 +1695,47 @@ def parse_model(d, ch, verbose=True):
             C2PSA_Mona,
             C3k2_Mona,
             C3k2_DCNv4,
-            C3k2_EfficientVIM_att
+            C3k2_EfficientVIM_att,
+            C3k2_LFEM,
+            C3k2_RepViTBlock,
+            SimAM,
+            # C3k2_MobileNetV4,
+            C3k2_StarNB,
+            C3k2_GCConv,
+            C3k2_LSBlock,
+            C3k2_FDConv,
+            MANet,
+            CSPStage,
+            VoVGSCSP
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
+        # m = (
+        #     getattr(torch.nn, m[3:])
+        #     if "nn." in m
+        #     else getattr(__import__("torchvision").ops, m[16:])
+        #     if "torchvision.ops." in m
+        #     else globals()[m]
+        # )  # get module
+
+        try:
+            if m == 'node_mode':
+                m = d[m]
+                if len(args) > 0:
+                    if args[0] == 'head_channel':
+                        args[0] = int(d[args[0]])
+            t = m 
+            m = getattr(torch.nn, m[3:]) if "nn." in m else getattr(__import__("torchvision").ops, m[16:]) if "torchvision.ops." in m else globals()[m]
+        except:
+            pass
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
+            if args[0] == 'head_channel':
+                args[0] = d[args[0]]
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1676,13 +1759,90 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
-        elif m is DySample:
+        elif m in {DySample,EUCB,EUCB_SC,CARAFE}:
             c2 = ch[f]
             args = [c2, *args]
-        elif m is CGAFusion_SWS:
+        elif m is MultiDilatelocalAttention:
+            c2 = ch[f]
+            args = [c2, *args]
+        elif m is EMCA_attention:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, *args[1:]]
+        elif m is SDI:
+            args = [[ch[x] for x in f]]
+        elif m is SimAMWithSlicing:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, *args[1:]]
+        elif m is Fusion:
+            args[0] = d[args[0]]
+            c1, c2 = [ch[x] for x in f], (sum([ch[x] for x in f]) if args[0] == 'concat' else ch[f[0]])
+            args = [c1, args[0]]
+        elif m in {GDSAFusion}:
+            c1 = [ch[x] for x in f]
+            c2 = sum(c1)
+            args = [*c1, *args]    
+        elif m in {CGAFusion_SWS, CGAFusion}:
             c2 = ch[f[1]]
             args = [c2, *args]
-
+        elif m is DPCF:
+            c1 = [ch[x] for x in f]
+            c2 = make_divisible(min(args[0], max_channels) * width, 8)
+            args = [c1, c2]
+        elif m in {SBA}:
+            c1 = [ch[x] for x in f]
+            c2 = c1[-1]
+            args = [c1, c2]
+        elif m in {HAFB}:
+            if args[0] == 'head_channel':
+                args[0] = d[args[0]]
+            c1 = [ch[x] for x in f]
+            c2 = make_divisible(min(args[0], max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+        elif m in {ContextGuideFusionModule}:
+            c1 = [ch[x] for x in f]
+            c2 = 2 * c1[1]
+            args = [c1]  
+        elif m is HyperComputeModule:
+            c1, c2 = ch[f], args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, threshold]
+        # --------------GOLD-YOLO--------------
+        elif m in {SimFusion_4in, AdvPoolFusion}:
+            c2 = sum(ch[x] for x in f)
+        elif m is SimFusion_3in:
+            c2 = args[0]
+            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [[ch[f_] for f_ in f], c2]
+        elif m is IFM:
+            c1 = ch[f]
+            c2 = sum(args[0])
+            args = [c1, *args]
+        elif m is InjectionMultiSum_Auto_pool:
+            c1 = ch[f[0]]
+            c2 = args[0]
+            args = [c1, *args]
+        elif m is PyramidPoolAgg:
+            c2 = args[0]
+            args = [sum([ch[f_] for f_ in f]), *args]
+        elif m is TopBasicLayer:
+            c2 = sum(args[1])
+        # --------------GOLD-YOLO--------------
+        elif m is SegNext_Attention:
+            c2 = ch[f]
+            args = [c2, *args]
+        elif m is PST:
+            c1, c_up, c2 = ch[f[0]], ch[f[1]], args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c_up, c2, *args[1:]]
+            args.insert(3, n)  # number of repeats
+            n = 1
+            if scale in "lx":  # for L/X sizes
+                args.extend((True, 1.2))
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -1698,9 +1858,11 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                Detect_LADH,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
+                Segment_LADH,
                 Segment26,
                 YOLOESegment,
                 YOLOESegment26,
@@ -1711,9 +1873,9 @@ def parse_model(d, ch, verbose=True):
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
-            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
+            if m in {Segment, Segment_LADH, YOLOESegment, Segment26, YOLOESegment26}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {Detect, Detect_LADH, YOLOEDetect, Segment, Segment_LADH, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])
@@ -1721,6 +1883,8 @@ def parse_model(d, ch, verbose=True):
             args.insert(1, [ch[x] for x in f])  # channels as second arg
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+        elif m in {LSKBlock, BiLevelRoutingAttention}:
+            args = [ch[f], *args]
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]

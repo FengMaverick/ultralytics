@@ -92,6 +92,8 @@ from .head import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    Detect_LADH,
+    Segment_LADH,
 )
 from .transformer import (
     AIFI,
@@ -187,4 +189,6 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "Detect_LADH",
+    "Segment_LADH",
 )

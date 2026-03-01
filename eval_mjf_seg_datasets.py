@@ -4,7 +4,7 @@ import os
 
 def main():
     # 1. 确认模型路径
-    model_path = "/home/aa205/MJF/ultralytics/runs/segment/train-nnmsdyV3-yolo11s_seg_e300/weights/best.pt"
+    model_path = "runs/segment/train-msdyV3-yolo11s_seg/weights/best.pt"
     if not os.path.exists(model_path):
         print(f"错误: 找不到模型文件 {model_path}")
         return
@@ -14,13 +14,13 @@ def main():
 
     # 2. 核心评估代码
     metrics = model.val(
-        data="/home/aa205/MJF/datasets/Instance_Segment_datasets/nnew_mjf_seg_datasets_yolo_V3/dataset.yaml",
+        data="/home/aa205/MJF/datasets/Instance_Segment_datasets/mjf_seg_datasets_yolo_V3/dataset.yaml",
         split="test",  # 确定用于验证的数据集分割（val, test或 train）
-        batch=16,
+        batch=32,
         imgsz=640,
         device=0,
         plots=True,  # 生成并保存预测与真实值的对比图、混淆矩阵和 PR 曲线
-        name="val_train-nnmsdyV3-yolo11s_seg_e300",
+        name="val_train-msdyV3-yolo11s_seg",
         exist_ok=True  # 允许覆盖现有的 project/name 目录
     )
 

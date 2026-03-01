@@ -144,14 +144,14 @@ class GMSA(nn.Module):
     def __init__(self,
                  oup_channels: int,
                  group_num: int = 16,
-                 gate_treshold: float = 0.5,
+                 gate_threshold: float = 0.5,
                  torch_gn: bool = False
                  ):
         super().__init__()
 
         self.gn = GroupBatchnorm2d(
             c_num=oup_channels, group_num=group_num)
-        self.gate_treshold = gate_treshold
+        self.gate_threshold = gate_threshold
         self.sigomid = nn.Sigmoid()
         self.tq = TQ(oup_channels, oup_channels)
 

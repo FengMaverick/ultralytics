@@ -16,16 +16,16 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
-from .conv import Conv, DWConv
+from .conv import Conv, DWConv, DSConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
 __all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 ###################### SEAM  ####     START  #############################
-class Residual(nn.Module):
+class BasicResidual(nn.Module):
     def __init__(self, fn):
-        super(Residual, self).__init__()
+        super(BasicResidual, self).__init__()
         self.fn = fn
 
     def forward(self, x):
@@ -38,7 +38,7 @@ class SEAM(nn.Module):
             c2 = c1
         self.DCovN = nn.Sequential(
             *[nn.Sequential(
-                Residual(nn.Sequential(
+                BasicResidual(nn.Sequential(
                     nn.Conv2d(in_channels=c2, out_channels=c2, kernel_size=3, stride=1, padding=1, groups=c2),
                     nn.GELU(),
                     nn.BatchNorm2d(c2)
@@ -83,7 +83,203 @@ class SEAM(nn.Module):
             if layer.bias is not None:
                 torch.nn.init.constant_(layer.bias, 0)
 
+def DcovN(c1, c2, depth, kernel_size=3, patch_size=3):
+    dcovn = nn.Sequential(
+        nn.Conv2d(c1, c2, kernel_size=patch_size, stride=patch_size),
+        nn.SiLU(),
+        nn.BatchNorm2d(c2),
+        *[nn.Sequential(
+            BasicResidual(nn.Sequential(
+                nn.Conv2d(in_channels=c2, out_channels=c2, kernel_size=kernel_size, stride=1, padding=1, groups=c2),
+                nn.SiLU(),
+                nn.BatchNorm2d(c2)
+            )),
+            nn.Conv2d(in_channels=c2, out_channels=c2, kernel_size=1, stride=1, padding=0, groups=1),
+            nn.SiLU(),
+            nn.BatchNorm2d(c2)
+        ) for i in range(depth)]
+    )
+    return dcovn
+
+class MultiSEAM(nn.Module):
+    def __init__(self, c1, c2, depth, kernel_size=3, patch_size=[3, 5, 7], reduction=16):
+        super(MultiSEAM, self).__init__()
+        if c1 != c2:
+            c2 = c1
+        self.DCovN0 = DcovN(c1, c2, depth, kernel_size=kernel_size, patch_size=patch_size[0])
+        self.DCovN1 = DcovN(c1, c2, depth, kernel_size=kernel_size, patch_size=patch_size[1])
+        self.DCovN2 = DcovN(c1, c2, depth, kernel_size=kernel_size, patch_size=patch_size[2])
+        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(c2, c2 // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c2 // reduction, c2, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y0 = self.DCovN0(x)
+        y1 = self.DCovN1(x)
+        y2 = self.DCovN2(x)
+        y0 = self.avg_pool(y0).view(b, c)
+        y1 = self.avg_pool(y1).view(b, c)
+        y2 = self.avg_pool(y2).view(b, c)
+        y4 = self.avg_pool(x).view(b, c)
+        y = (y0 + y1 + y2 + y4) / 4
+        y = self.fc(y).view(b, c, 1, 1)
+        y = torch.exp(y)
+        return x * y.expand_as(x)
 ###################### SEAM  ####     END  #############################
+
+######################################## ScConv begin ########################################
+
+# CVPR2023 https://openaccess.thecvf.com/content/CVPR2023/papers/Li_SCConv_Spatial_and_Channel_Reconstruction_Convolution_for_Feature_Redundancy_CVPR_2023_paper.pdf
+class GroupBatchnorm2d(nn.Module):
+    def __init__(self, c_num:int, 
+                 group_num:int = 16, 
+                 eps:float = 1e-10
+                 ):
+        super(GroupBatchnorm2d,self).__init__()
+        assert c_num    >= group_num
+        self.group_num  = group_num
+        self.gamma      = nn.Parameter(torch.randn(c_num, 1, 1))
+        self.beta       = nn.Parameter(torch.zeros(c_num, 1, 1))
+        self.eps        = eps
+
+    def forward(self, x):
+        N, C, H, W  = x.size()
+        x           = x.view(   N, self.group_num, -1   )
+        mean        = x.mean(   dim = 2, keepdim = True )
+        std         = x.std (   dim = 2, keepdim = True )
+        x           = (x - mean) / (std+self.eps)
+        x           = x.view(N, C, H, W)
+        return x * self.gamma + self.beta
+
+class SRU(nn.Module):
+    def __init__(self,
+                 oup_channels:int, 
+                 group_num:int = 16,
+                 gate_treshold:float = 0.5 
+                 ):
+        super().__init__()
+        
+        self.gn             = GroupBatchnorm2d( oup_channels, group_num = group_num )
+        self.gate_treshold  = gate_treshold
+        self.sigomid        = nn.Sigmoid()
+
+    def forward(self,x):
+        gn_x        = self.gn(x)
+        w_gamma     = self.gn.gamma/sum(self.gn.gamma)
+        reweigts    = self.sigomid( gn_x * w_gamma )
+        # Gate
+        info_mask   = reweigts>=self.gate_treshold
+        noninfo_mask= reweigts<self.gate_treshold
+        x_1         = info_mask * x
+        x_2         = noninfo_mask * x
+        x           = self.reconstruct(x_1,x_2)
+        return x
+    
+    def reconstruct(self,x_1,x_2):
+        x_11,x_12 = torch.split(x_1, x_1.size(1)//2, dim=1)
+        x_21,x_22 = torch.split(x_2, x_2.size(1)//2, dim=1)
+        return torch.cat([ x_11+x_22, x_12+x_21 ],dim=1)
+
+
+class CRU(nn.Module):
+    '''
+    alpha: 0<alpha<1
+    '''
+    def __init__(self, 
+                 op_channel:int,
+                 alpha:float = 1/2,
+                 squeeze_radio:int = 2 ,
+                 group_size:int = 2,
+                 group_kernel_size:int = 3,
+                 ):
+        super().__init__()
+        self.up_channel     = up_channel   =   int(alpha*op_channel)
+        self.low_channel    = low_channel  =   op_channel-up_channel
+        self.squeeze1       = nn.Conv2d(up_channel,up_channel//squeeze_radio,kernel_size=1,bias=False)
+        self.squeeze2       = nn.Conv2d(low_channel,low_channel//squeeze_radio,kernel_size=1,bias=False)
+        #up
+        self.GWC            = nn.Conv2d(up_channel//squeeze_radio, op_channel,kernel_size=group_kernel_size, stride=1,padding=group_kernel_size//2, groups = group_size)
+        self.PWC1           = nn.Conv2d(up_channel//squeeze_radio, op_channel,kernel_size=1, bias=False)
+        #low
+        self.PWC2           = nn.Conv2d(low_channel//squeeze_radio, op_channel-low_channel//squeeze_radio,kernel_size=1, bias=False)
+        self.advavg         = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self,x):
+        # Split
+        up,low  = torch.split(x,[self.up_channel,self.low_channel],dim=1)
+        up,low  = self.squeeze1(up),self.squeeze2(low)
+        # Transform
+        Y1      = self.GWC(up) + self.PWC1(up)
+        Y2      = torch.cat( [self.PWC2(low), low], dim= 1 )
+        # Fuse
+        out     = torch.cat( [Y1,Y2], dim= 1 )
+        out     = F.softmax( self.advavg(out), dim=1 ) * out
+        out1,out2 = torch.split(out,out.size(1)//2,dim=1)
+        return out1+out2
+
+
+class ScConv(nn.Module):
+    # https://github.com/cheng-haha/ScConv/blob/main/ScConv.py
+    def __init__(self,
+                op_channel:int,
+                group_num:int = 16,
+                gate_treshold:float = 0.5,
+                alpha:float = 1/2,
+                squeeze_radio:int = 2 ,
+                group_size:int = 2,
+                group_kernel_size:int = 3,
+                 ):
+        super().__init__()
+        self.SRU = SRU(op_channel, 
+                       group_num            = group_num,  
+                       gate_treshold        = gate_treshold)
+        self.CRU = CRU(op_channel, 
+                       alpha                = alpha, 
+                       squeeze_radio        = squeeze_radio ,
+                       group_size           = group_size ,
+                       group_kernel_size    = group_kernel_size)
+    
+    def forward(self,x):
+        x = self.SRU(x)
+        x = self.CRU(x)
+        return x
+    
+######################################## ScConv end ########################################
+
+######################################## PConv begin ########################################
+class Partial_conv3(nn.Module):
+    def __init__(self, dim, n_div=4, forward='split_cat'):
+        super().__init__()
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.partial_conv3 = nn.Conv2d(self.dim_conv3, self.dim_conv3, 3, 1, 1, bias=False)
+
+        if forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x):
+        # only for inference
+        x = x.clone()   # !!! Keep the original input intact for the residual connection later
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(x[:, :self.dim_conv3, :, :])
+        return x
+
+    def forward_split_cat(self, x):
+        # for training/inference
+        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
+        x1 = self.partial_conv3(x1)
+        x = torch.cat((x1, x2), 1)
+        return x
+    
+######################################## PConv end ########################################
 
 class Detect(nn.Module):
     """YOLO Detect head for object detection models.
@@ -154,6 +350,7 @@ class Detect(nn.Module):
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         
+        # [!!! Original !!!]
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
@@ -170,23 +367,63 @@ class Detect(nn.Module):
             )
         )
 
-
+        # [!!! SEAM !!!]
         # self.cv2 = nn.ModuleList(
-        #     nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), SEAM(c2, c2, 1, 16), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        #     nn.Sequential(Conv(x, c2, 3), SEAM(c2, c2, 1, 16), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         # )
         # self.cv3 = (
-        #     nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), SEAM(c3, c3, 1, 16), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        #     nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        #     if self.legacy
+        #     else nn.ModuleList(
+        #         nn.Sequential(
+        #             nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+        #             SEAM(c3, c3, 1, 16),
+        #             nn.Conv2d(c3, self.nc, 1)
+        #         )
+        #         for x in ch
+        #     )
+        # )
+
+        # [!!! new SEAM !!!]
+        # self.cv2 = nn.ModuleList(
+        #     nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), BasicResidual(SEAM(c2, c2, 1, 16)), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        # )
+        # self.cv3 = (
+        #     nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
         #     if self.legacy
         #     else nn.ModuleList(
         #         nn.Sequential(
         #             nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
         #             nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-        #             SEAM(c3, c3, 1, 16),
+        #             BasicResidual(SEAM(c3, c3, 1, 16)),
         #             nn.Conv2d(c3, self.nc, 1),
         #         )
         #         for x in ch
         #     )
         # )
+
+        # [!!! MultiSEAM !!!]
+        # self.cv2 = nn.ModuleList(
+        #     nn.Sequential(Conv(x, c2, 3), MultiSEAM(c2, c2, 1), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        # )
+        # self.cv3 = (
+        #     nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        #     if self.legacy
+        #     else nn.ModuleList(
+        #         nn.Sequential(
+        #             nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+        #             MultiSEAM(c3, c3, 1),
+        #             nn.Conv2d(c3, self.nc, 1)
+        #         )
+        #         for x in ch
+        #     )
+        # )
+
+        # [!!! Original + ScConv !!!]
+        # self.stem = nn.ModuleList(nn.Sequential(ScConv(x), Conv(x, x, 1)) for x in ch)
+
+        # [!!! Original + PConv !!!]
+        # self.stem = nn.ModuleList(nn.Sequential(Partial_conv3(x, 4), Conv(x, x, 1)) for x in ch)
 
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
@@ -229,6 +466,11 @@ class Detect(nn.Module):
         self, x: list[torch.Tensor]
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
+        
+        # [!!! 新增 !!!] 遍历多尺度特征，并将它们先通过 stem 模块（如 ScConv）进行特征提纯
+        if hasattr(self, "stem") and self.stem is not None:
+            x = [self.stem[i](x[i]) for i in range(self.nl)]
+
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
@@ -367,7 +609,6 @@ class Segment(Detect):
 
         c4 = max(ch[0] // 4, self.nm)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
-        # self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), SEAM(c4, c4, 1, 16), nn.Conv2d(c4, self.nm, 1)) for x in ch)
         if end2end:
             self.one2one_cv4 = copy.deepcopy(self.cv4)
 
@@ -1854,3 +2095,63 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+# ============================================================================
+# LADH
+# ============================================================================
+class Detect_LADH(Detect):
+    """YOLO Detect head with LADH (Lightweight Asymmetric) modules."""
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize the YOLO detection layer with LADH architecture."""
+        # 1. 调用父类 Detect，初始化各种参数如 nc, nl, strides 等
+        super().__init__(nc, reg_max, end2end, ch)
+        
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))
+
+        # 2. 暴力覆写原版的 cv2 (定位分支)，使用深度的连续 DSConv + 1x1 Conv
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(DSConv(x, c2, 3), DSConv(c2, c2, 3), DSConv(c2, c2, 3), Conv(c2, c2, 1), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        
+        # 3. 暴力覆写原版的 cv3 (分类分支), 原作中为连续 1x1 Conv 快通道
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 1), Conv(c3, c3, 1), nn.Conv2d(c3, self.nc, 1)) for x in ch
+        )
+
+        # 4. 如果启用了端到端架构 (YOLOv10范式)，让 one2one_xxx 同样装载 LADH
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class Segment_LADH(Segment):
+    """YOLO Segment head with LADH modules for instance segmentation tasks."""
+
+    def __init__(self, nc: int = 80, nm: int = 32, npr: int = 256, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize the segmentation model attributes and LADH convolution layers."""
+        # 1. 调用父类 Segment 初始化，这里连带生成了原版的 cv2/cv3/cv4 以及 proto
+        super().__init__(nc, nm, npr, reg_max, end2end, ch)
+        
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))
+        c4 = max(ch[0] // 4, self.nm)
+
+        # 2. 同样地，把基础检测部分的 cv2 和 cv3 替换为 LADH 构成
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(DSConv(x, c2, 3), DSConv(c2, c2, 3), DSConv(c2, c2, 3), Conv(c2, c2, 1), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 1), Conv(c3, c3, 1), nn.Conv2d(c3, self.nc, 1)) for x in ch
+        )
+        
+        # 3. 替换属于掩码(mask)专用的分类分支 cv4，也换成它的 LADH 版本
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(DSConv(x, c4, 3), DSConv(c4, c4, 3), Conv(c4, c4, 1), nn.Conv2d(c4, self.nm, 1)) for x in ch
+        )
+
+        # 4. 如果开启端到端双流并行，别忘了覆盖 one2one 头
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
